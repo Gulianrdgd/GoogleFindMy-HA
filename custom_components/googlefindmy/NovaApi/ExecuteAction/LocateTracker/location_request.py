@@ -364,8 +364,14 @@ def create_location_request(
         # subscribed, causing it to drop reports between polling intervals.
         last_mode_switch = 0
 
+    # Use a fresh client UUID per locate request (as traccar-relay does) instead
+    # of the process-wide UUID shared with Play/Stop Sound. Sound requests keep
+    # the shared UUID in case a Stop must match the Play it cancels.
     action_request = create_action_request(
-        canonic_device_id, fcm_registration_id, request_uuid=request_uuid
+        canonic_device_id,
+        fcm_registration_id,
+        request_uuid=request_uuid,
+        fmd_client_uuid=generate_random_uuid(),
     )
 
     action_request.action.locateTracker.lastHighTrafficEnablingTime.seconds = int(
