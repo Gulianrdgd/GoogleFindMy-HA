@@ -56,6 +56,11 @@ from custom_components.googlefindmy.SpotApi.spot_request import SpotAuthPermanen
 
 _LOGGER = logging.getLogger(__name__)
 
+# Value GoogleFindMyTools and traccar-relay hard-code for
+# ``locateTracker.lastHighTrafficEnablingTime`` (2024-11-20). Used when no real
+# contributor-mode switch time is known.
+REFERENCE_LAST_MODE_SWITCH = 1732120060
+
 
 # Flow-position markers for ``LocationRequestNotAcceptedError``. This is a CLOSED
 # set of POSITIONS in the request flow, never a cause taxonomy. Deciding what a
@@ -359,10 +364,13 @@ def create_location_request(
 
     normalized_mode = _normalize_contributor_mode(contributor_mode)
     if last_mode_switch is None or last_mode_switch <= 0:
-        # Use 0 to request all available historical reports.  The previous
-        # default of ``int(time.time())`` effectively told the server we just
-        # subscribed, causing it to drop reports between polling intervals.
-        last_mode_switch = 0
+        # Fixed past timestamp, matching GoogleFindMyTools and traccar-relay.
+        # It must not be ``int(time.time())``: that tells the server we just
+        # subscribed, and it then drops reports between polling intervals.
+        # It was 0 before; a timestamp this old requests the same full report
+        # history while keeping the payload byte-identical to those clients,
+        # which is the point of the experiment (BSkando#211 / #222).
+        last_mode_switch = REFERENCE_LAST_MODE_SWITCH
 
     # Use a fresh client UUID per locate request (as traccar-relay does) instead
     # of the process-wide UUID shared with Play/Stop Sound. Sound requests keep
