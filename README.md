@@ -44,6 +44,7 @@ For the quickest way to bootstrap Home Assistant test stubs before running `pyte
 - `make test-ha` — execute the targeted regression smoke tests (`tests/test_entity_recovery_manager.py`, `tests/test_homeassistant_callback_stub_helper.py`) and then run `pytest -q --cov` for the full suite while teeing detailed output to `pytest_output.log`. Append flags such as `--maxfail=1 -k recovery` with `make test-ha PYTEST_ARGS="…"` when you need custom pytest options, or override the coverage summary with `make test-ha PYTEST_COV_FLAGS="--cov-report=term"` for slimmer output.
 - `make test-cov` — run `pytest -q --cov` with coverage reporting (output teed to `pytest_output.log`).
 - `make test-single TEST=<path>` — run a single test file with optional `PYTEST_ARGS`.
+- `make preflight` — run the full local preflight S1 to S8 before opening a pull request (format, lint, types, spelling, suite plus project coverage, patch coverage) and print every stage as `OK`, `FAILED`, `NOTE` or `NOT CHECKED` with a reason. Name one interpreter per Home Assistant track with `make preflight PREFLIGHT_PYTHONS="/track-a/bin/python /track-b/bin/python"`; the paths are machine-local, so the variable is empty by default. Details in `script/AGENTS.md`.
 - `make translation-check` — check for missing translation keys across all locale files.
 - `make check-ha-compat` — check dependency compatibility with Home Assistant.
 - `script/bootstrap_ssot_cached.sh` — stage the Home Assistant Single Source of Truth (SSoT) wheels in `.wheelhouse/ssot` and install them from the local cache. Pass `SKIP_WHEELHOUSE_REFRESH=1` to reuse the cached artifacts on subsequent bootstrap runs or `PYTHON=python3.12` to target an alternate interpreter. The helper also validates `.wheelhouse/ssot` against `script/ssot_wheel_manifest.txt` (override with `SSOT_MANIFEST=…`) so repeated runs can confirm the primary wheels are cached without re-listing the full directory.
@@ -109,6 +110,7 @@ When a dependency pin changes, delete the archive (and `.wheelhouse/`) or rerun
 - `make test-unload`: Execute the targeted unload regression suite (`tests/test_unload_subentry_cleanup.py`) to verify the parent-unload rollback path.
 - `make test-cov`: Run `pytest -q --cov` with coverage reporting (output teed to `pytest_output.log`).
 - `make test-single TEST=<path>`: Run a single test file with optional `PYTEST_ARGS`.
+- `make preflight`: Run the local preflight S1 to S8 and print the stage report; pass the tracks with `PREFLIGHT_PYTHONS="…"` (space separated, empty by default because the paths are machine-local). Unlike the other targets this one does not go through `poetry run`, because each track is its own virtualenv.
 - `make translation-check`: Check for missing translation keys across all locale files.
 - `make check-ha-compat`: Check dependency compatibility with Home Assistant via `script/check_ha_compatibility.py`.
 - `make doctoc`: Regenerate the AGENTS.md table of contents (requires Node.js; installs DocToc via `make bootstrap-doctoc`).
@@ -250,8 +252,9 @@ link then returns "Unauthorized".
 
 You do not have to restart to fix that. Call the service
 **`googlefindmy.refresh_device_urls`** (Developer tools → Actions → *Refresh
-Device URLs*); it rewrites the configuration URL of every device with a current
-token, and the link works again immediately.
+Device URLs*); it rewrites the configuration URL of every device that belongs to one of this
+integration's config entries with a current token, and the link works again
+immediately.
 
 One prerequisite: Home Assistant must have a reachable base URL. If none is
 configured, the service logs a warning and updates nothing, so the stale link
@@ -607,21 +610,34 @@ configuration.
 - Authentication tokens are securely cached
 - All GPS coordinates are processed locally. The integration itself sends no
   location data anywhere except to Google, which is where it comes from.
-- **The exceptions, and they are yours to trigger.** Opening a Map View page
-  makes your browser talk to two third parties:
-  - **Map tiles** from OpenStreetMap (`https://{s}.tile.openstreetmap.org/...`).
-    The page fits its view to *all* locations it shows, so with the default
-    history window the requested area is the area your device moved through
-    during that window, not just its current position. The requests carry no
-    device name, no account and no coordinates as such, but the requested tiles
-    do describe that area.
-  - **The Leaflet library** from `unpkg.com`, which the page currently loads to
-    draw the map. That request carries no location data at all, only the fact
-    that the page was opened. It is being removed in favour of a copy shipped
-    with the integration.
+- **The exception, and it is yours to trigger.** Opening a Map View page
+  loads **map tiles** from OpenStreetMap, and which party OpenStreetMap sees
+  depends on your Core version. The page detects that at runtime; the minimum
+  Core version above does not change:
+  - **Core 2026.9 or newer** ships the `map_tiles` integration (a dependency of
+    `frontend`, so it is loaded in every standard installation). The page then
+    requests its tiles from your own instance (`/api/map_tiles/raster/...`),
+    and the instance forwards them to OpenStreetMap with Home Assistant's
+    application `User-Agent` and contact address, through a server-side cache.
+    OpenStreetMap sees your instance, not your browser's address and not your
+    installation URL (which the direct path below reveals through the referrer
+    when you open the page through Nabu Casa or another public hostname).
+  - **Older Cores** keep the previous behaviour: the browser fetches the tiles
+    directly from `https://tile.openstreetmap.org/...` with
+    `referrerPolicy: 'origin'`, so OpenStreetMap sees the browser's address and
+    the origin of the page, but not its path and not the access token in it.
 
-  Nothing is requested while no Map View page is open, and no other page of this
-  integration loads either.
+  On both paths the page fits its view to *all* locations it shows, so with
+  the default history window the requested area is the area your device moved
+  through during that window, not just its current position. The requests carry
+  no device name, no account and no coordinates as such, but the requested
+  tiles do describe that area, now as seen from the instance on the proxy path
+  and from the browser on the direct path.
+
+  The Leaflet library that draws the map is shipped with the integration and
+  embedded inline in the page: no CDN is contacted. Nothing is requested while
+  no Map View page is open, and no other page of this integration loads
+  either.
 
 ## Security considerations
 
@@ -634,7 +650,7 @@ configuration.
 | The location history of every tracker | Home Assistant's recorder database (`home-assistant_v2.db` by default) | Not written by this integration but by Home Assistant, recording the entities it creates, including the recorder-only `last_latitude`/`last_longitude` attributes the Map View reads back (`map_view.py`, `get_significant_states`). It is kept for as long as your `recorder` `purge_keep_days` says, and it travels with any backup that includes the database (Home Assistant's backup manager offers that as a choice; a recorder pointed at an external database is not in the backup at all). Exclude the entities under `recorder:` if you do not want that history |
 | The pasted bundle and the OAuth token | Also the config entry (`.storage/core.config_entries`) | On **initial setup** they are moved into the token cache on the first successful start and removed from the entry. Two cases keep them there indefinitely: a setup that fails before that point, and any later credential replacement (reauth or the options flow), because `config_flow.py` → `_persist_secrets_bundle` writes them back and the reload then finds a primed cache and skips the removal (`__init__.py`, the `legacy_cache_primed` branch). The copy lives beside the token cache in the same `.storage` directory, so it widens no trust boundary, and the diagnostics download redacts it |
 | Derived tokens (AAS, ADM, SPOT), FCM push identity, the shared key and the owner key | Same per-entry storage file | Refreshed automatically; the long-lived ones are what make the integration work after a restart |
-| The Map View access token | Derived on demand from the instance UUID and the entry id, and carried inside each device's `configuration_url` in `.storage/core.device_registry` | Treat that URL as long-lived bearer material: the map view is not behind Home Assistant's login, so whoever holds the link sees the device's location. The token authenticates the **config entry**, not one device (`map_view.py` → `_resolve_entry_by_token`), so a recipient who knows another device id of the same account can substitute it in the path. With the default `map_view_token_expiration` (off) the token never expires |
+| The Map View access token | Derived on demand from the instance UUID and the entry id, and carried inside each device's `configuration_url` in `.storage/core.device_registry` | Treat that URL as long-lived bearer material: the map view is not behind Home Assistant's login, so whoever holds the link sees the device's location. The token authenticates the **config entry**, not one device (`map_view.py` → `_resolve_entry_by_token`), so a recipient who knows another device id of the same account can substitute it in the path. With the default `map_view_token_expiration` (off) the token never expires. On Core 2026.9 or newer a page opened with this token can also fetch the current map tiles access token of Core's `map_tiles` proxy (`/api/googlefindmy/map_tiles_token`, same share-token check as the page itself, with the share token sent in the `X-GoogleFindMy-Map-Token` request header rather than in the URL, so it does not land in access logs), which grants nothing but the tile and map resources of that proxy (raster and vector tiles, TileJSON, glyphs, sprites; as of Core 2026.9), rotates every 30 minutes and is already embedded in the page's HTML |
 
 `secrets.json` is **not** part of the running integration. It is produced by the
 manual command-line login, and if you paste its contents, no file by that name
@@ -816,7 +832,7 @@ To contribute, please:
 2. Create a feature branch
 3. Install the development dependencies with `make install-dev` (or `poetry install --with dev,test`)
 4. Install the development hooks with `pre-commit install` and ensure `pre-commit run --all-files` passes before submitting changes. If the CLI entry points are unavailable, use the `python -m` fallbacks from the [module invocation primer](AGENTS.md#module-invocation-primer) to run the same commands reliably.
-5. Run `python script/local_verify.py` to execute the required `ruff format --check` and `pytest -q` commands together (or invoke `python script/precommit_hooks/ruff_format.py --check ...` and `pytest -q` manually if you need custom arguments).
+5. Run `python script/local_verify.py` to execute the required `ruff format --check` and `pytest -q` commands together (or invoke `python script/precommit_hooks/ruff_format.py --check ...` and `pytest -q` manually if you need custom arguments). Before opening a pull request, `python script/local_verify.py --all` runs the wider preflight (format, lint, types, spelling, suite plus project coverage, patch coverage) and reports every stage as `OK`, `FAILED`, `NOTE` or `NOT CHECKED` with a reason; see `script/AGENTS.md`.
 6. When running pytest (either through the helper script or directly) fix any failures and address every `DeprecationWarning` you encounter—rerun with `PYTHONWARNINGS=error::DeprecationWarning pytest -q` if you need help spotting new warnings.
 7. Test thoroughly with your Find My devices
 8. Submit a pull request with detailed description

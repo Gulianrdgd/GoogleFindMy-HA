@@ -260,12 +260,15 @@ def pytest_runtest_setup(item: pytest.Item) -> None:
     pytest_socket.socket_allow_hosts(["127.0.0.1", "::1", "localhost"])
 
 
+from tests.helpers import deprecation_recorder as _deprecation_recorder
 from tests.helpers import (
     install_homeassistant_core_callback_stub,
     install_homeassistant_network_stub,
 )
+from tests.helpers import single_owner_device_registry as _single_owner_registry
 from tests.helpers.config_entries_stub import install_config_entries_stubs
 from tests.helpers.constants import load_googlefindmy_const_module
+from tests.helpers.core_shutdown_state import seed_core_shutdown_state
 
 ConfigEntryAuthFailed: type[Exception] = Exception
 
@@ -387,6 +390,7 @@ def _heal_lazy_runtime_imports() -> None:
         "DiscoveryManager",
         "GoogleFindMyMapView",
         "GoogleFindMyMapRedirectView",
+        "GoogleFindMyMapTilesTokenView",
     )
     any_placeholder = any(
         "Placeholder" in getattr(getattr(integration, name, None), "__name__", "")
@@ -1708,7 +1712,17 @@ def _stub_homeassistant() -> None:
     _T = TypeVar("_T")
 
     class DataUpdateCoordinator(Generic[_T]):
-        """Minimal stub for DataUpdateCoordinator supporting subclassing."""
+        """Minimal stub for DataUpdateCoordinator supporting subclassing.
+
+        ``async_shutdown`` and the two removers it calls mirror the core
+        (``homeassistant/helpers/update_coordinator.py``, 2026.8.2, lines 210
+        to 239) line for line, because ``GoogleFindMyCoordinator.async_shutdown``
+        chains to them and the suite runs every shutdown path against this
+        stub. ``tests/test_core_shutdown_stub_parity.py`` holds the mirror to
+        the real class. The four attributes are the ones the core's
+        ``__init__`` gives them; ``_debounced_refresh`` is a two-method
+        stand-in for the ``Debouncer`` surface the core's shutdown uses.
+        """
 
         def __init__(
             self, hass=None, logger=None, name: str | None = None, update_interval=None
@@ -1717,6 +1731,31 @@ def _stub_homeassistant() -> None:
             self.logger = logger
             self.name = name or "coordinator"
             self.update_interval = update_interval
+            self._shutdown_requested = False
+            self._unsub_refresh: Callable[[], None] | None = None
+            self._unsub_shutdown: Callable[[], None] | None = None
+            self._debounced_refresh: Any = SimpleNamespace(
+                async_shutdown=lambda: None, async_cancel=lambda: None
+            )
+
+        async def async_shutdown(self) -> None:
+            """Cancel any scheduled call, and ignore new runs."""
+            self._shutdown_requested = True
+            self._async_unsub_refresh()
+            self._async_unsub_shutdown()
+            self._debounced_refresh.async_shutdown()
+
+        def _async_unsub_refresh(self) -> None:
+            """Cancel any scheduled call."""
+            if self._unsub_refresh:
+                self._unsub_refresh()
+                self._unsub_refresh = None
+
+        def _async_unsub_shutdown(self) -> None:
+            """Cancel any scheduled call."""
+            if self._unsub_shutdown:
+                self._unsub_shutdown()
+                self._unsub_shutdown = None
 
         async def async_request_refresh(
             self,
@@ -2127,6 +2166,7 @@ def fixture_coordinator_teardown_defaults() -> Callable[[Any], None]:
     def _apply(
         coordinator: Any, *, loop: asyncio.AbstractEventLoop | None = None
     ) -> None:
+        seed_core_shutdown_state(coordinator)
         if getattr(coordinator, "_dr_unsub", None) is None:
             coordinator._dr_unsub = lambda: None
         if getattr(coordinator, "_short_retry_cancel", None) is None:
@@ -2467,6 +2507,13 @@ def use_real_homeassistant_modules() -> Iterable[None]:
 
         _aiohttp_client._async_make_resolver = _async_make_resolver  # type: ignore[attr-defined]
 
+    # The real modules were just re-imported, which discards every binding the
+    # deprecation recorder made against the stubbed ones.  Re-install it here so
+    # tests running under this fixture still observe ``report_usage`` calls;
+    # without this the recorder can only stay silent, and silence looks exactly
+    # like "no deprecation".  See tests/helpers/deprecation_recorder.py.
+    _deprecation_recorder.rebind_active()
+
     try:
         yield
     finally:
@@ -2474,3 +2521,37 @@ def use_real_homeassistant_modules() -> Iterable[None]:
             if name.startswith("homeassistant"):
                 del sys.modules[name]
         sys.modules.update(saved_modules)
+
+
+@pytest.fixture(autouse=True)
+def device_registry_deprecations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> Iterable[_deprecation_recorder.DeprecationRecorder]:
+    """Record every ``report_usage`` call raised while a test runs.
+
+    Autouse so that no test can opt out of being observed; the recorded list is
+    only inspected where a test asks for this fixture by name.  The recorder
+    delegates to the original callable, so behaviour is unchanged: a deprecated
+    Core call made from outside ``custom_components/`` still raises, which two
+    tests in this repository depend on.
+    """
+    recorder = _deprecation_recorder.DeprecationRecorder()
+    _deprecation_recorder.install_recorder(monkeypatch, recorder)
+    try:
+        yield recorder
+    finally:
+        _deprecation_recorder.reset_active()
+
+
+@pytest.fixture
+def single_owner_device_registry() -> _single_owner_registry.SingleOwnerDeviceRegistry:
+    """Return a device registry double implementing the Core 2026.8+ rules.
+
+    Opt-in, not autouse: ``_StubDeviceRegistry`` still models the pre-2026.8
+    multi-owner world and is what several hundred existing assertions expect.
+    Switching everything at once would conflate a behaviour migration with a
+    test-harness migration.  New assertions about single ownership use this
+    fixture; ``tests/test_device_registry_single_owner_contract.py`` proves it
+    matches real Core.
+    """
+    return _single_owner_registry.SingleOwnerDeviceRegistry()

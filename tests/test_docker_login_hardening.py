@@ -67,6 +67,7 @@ import pty
 import re
 import selectors
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -787,6 +788,50 @@ def _extract_backgrounding_line(entrypoint: str) -> str:
     )
 
 
+def _skip_unless_sigint_is_measurable() -> None:
+    """Skip when this pytest process itself ignores ``SIGINT``.
+
+    A process started as a background job of a shell without job control
+    (``bash -c '... &'``, ``( nohup ... & )``) inherits ``SIG_IGN`` for ``SIGINT``,
+    and POSIX lets neither ``trap`` nor ``trap - INT`` in a non-interactive child
+    shell undo a disposition that was already ignored on entry. The test below
+    would then report ``SIGINT_OK=False`` whatever ``entrypoint.sh`` does: a fact
+    about how the runner was started, not about the launcher. Reporting it as a
+    skip with the cause keeps that measurement failure from reading like a
+    product defect (it did, once, in a preflight run started as a detached job).
+    CI runners start pytest with the default disposition, so this never skips
+    there.
+    """
+
+    if signal.getsignal(signal.SIGINT) is signal.SIG_IGN:
+        pytest.skip(
+            "this pytest process ignores SIGINT (started as a background job "
+            "without job control?); the launcher's SIGINT handling cannot be "
+            "measured from a runner that cannot receive the signal itself"
+        )
+
+
+def test_sigint_precondition_skips_when_the_runner_ignores_sigint() -> None:
+    """The guard skips (does not fail) when the runner inherited ``SIG_IGN``."""
+
+    previous = signal.signal(signal.SIGINT, signal.SIG_IGN)
+    try:
+        with pytest.raises(pytest.skip.Exception, match="ignores SIGINT"):
+            _skip_unless_sigint_is_measurable()
+    finally:
+        signal.signal(signal.SIGINT, previous)
+
+
+def test_sigint_precondition_is_silent_with_the_default_handler() -> None:
+    """With the default handler installed the guard returns without skipping."""
+
+    previous = signal.signal(signal.SIGINT, signal.default_int_handler)
+    try:
+        _skip_unless_sigint_is_measurable()
+    finally:
+        signal.signal(signal.SIGINT, previous)
+
+
 def test_backgrounded_login_child_behaviourally_keeps_stdin_and_default_sigint(
     tmp_path: Path,
 ) -> None:
@@ -864,9 +909,6 @@ def test_backgrounded_login_child_behaviourally_keeps_stdin_and_default_sigint(
     assert "STDIN_OK=True" in out, (
         f"backgrounded child did not receive terminal stdin via `<&0`; got: {out!r}"
     )
-    assert "SIGINT_OK=True" in out, (
-        f"backgrounded child kept the inherited SIG_IGN for SIGINT; got: {out!r}"
-    )
 
     # Negative control: without the `<&0` async-boundary redirect the child's stdin
     # is /dev/null, so the read fails -- proving the assertion discriminates.
@@ -875,6 +917,14 @@ def test_backgrounded_login_child_behaviourally_keeps_stdin_and_default_sigint(
     assert "STDIN_OK=False" in control_out, (
         "control without `<&0` unexpectedly read stdin; the behavioural stdin "
         f"assertion is not discriminating. got: {control_out!r}"
+    )
+
+    # The stdin proofs above do not depend on signal dispositions, so they stay
+    # measurable on every runner; only the SIGINT half needs a runner that can
+    # receive SIGINT itself, which is why the guard sits here and not at the top.
+    _skip_unless_sigint_is_measurable()
+    assert "SIGINT_OK=True" in out, (
+        f"backgrounded child kept the inherited SIG_IGN for SIGINT; got: {out!r}"
     )
 
 
@@ -988,6 +1038,50 @@ def test_wait_helper_clears_the_slot_and_ignores_an_empty_one() -> None:
     )
 
 
+READY_TIMEOUT_SECONDS = 10.0
+
+
+def _wait_until_ready(ready: Path) -> None:
+    """Block until the stub child reports that its signal handler is installed.
+
+    The two behavioural shutdown tests below relay SIGTERM to a Python child
+    that must already own a handler when the signal lands; otherwise the
+    default action kills it and the test measures interpreter start-up time,
+    not the helper under test. A fixed ``sleep(0.5)`` was that measurement:
+    it passed on an idle machine and failed under load during the preflight
+    runs of PR #1274. The child writes ``ready`` right after
+    ``signal.signal``, so the wait ends the moment the handler exists and
+    never earlier; the ceiling only turns a hung child into a failure.
+    """
+
+    deadline = time.monotonic() + READY_TIMEOUT_SECONDS
+    while not ready.exists():
+        assert time.monotonic() < deadline, (
+            f"the stub child never reported readiness via {ready} within "
+            f"{READY_TIMEOUT_SECONDS:g}s"
+        )
+        time.sleep(0.02)
+
+
+def _end(proc: subprocess.Popen[bytes]) -> None:
+    """Bring the outer bash down, relaying TERM first so its child can follow.
+
+    On the normal path the process has already exited and only the kill is a
+    no-op. On the failure path of ``_wait_until_ready`` a bare ``kill`` would
+    take the bash with SIGKILL, which runs no trap, and the stub child would
+    sleep on as an orphan for its full 30 s; a TERM first lets the trap relay.
+    """
+
+    if proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+    proc.kill()
+    proc.wait(timeout=15)
+
+
 def test_wait_helper_behaviourally_survives_a_child_that_outlives_one_signal(
     tmp_path: Path,
 ) -> None:
@@ -1008,14 +1102,16 @@ def test_wait_helper_behaviourally_survives_a_child_that_outlives_one_signal(
     on_signal = _extract_shell_function(entrypoint, "on_signal")
     wait_helper = _extract_shell_function(entrypoint, "wait_for_tracked_child")
     rc_file = tmp_path / "rc"
+    ready = tmp_path / "ready"
 
     stub = tmp_path / "slow_shutdown_child.py"
     stub.write_text(
-        "import signal, sys, time\n"
+        "import pathlib, signal, sys, time\n"
         "def _handler(signum, frame):\n"
         "    time.sleep(1)  # graceful shutdown still in progress\n"
         "    sys.exit(5)\n"
         "signal.signal(signal.SIGTERM, _handler)\n"
+        f"pathlib.Path({str(ready)!r}).touch()\n"
         "time.sleep(30)\n",
         encoding="utf-8",
     )
@@ -1038,12 +1134,11 @@ def test_wait_helper_behaviourally_survives_a_child_that_outlives_one_signal(
         ["bash", "-c", script], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
     )
     try:
-        time.sleep(0.5)
+        _wait_until_ready(ready)
         proc.terminate()
         proc.wait(timeout=15)
     finally:
-        proc.kill()
-        proc.wait(timeout=15)
+        _end(proc)
 
     assert rc_file.exists(), "the helper never returned after the forwarded signal"
     assert rc_file.read_text().strip() == "5", (
@@ -1074,11 +1169,13 @@ def test_terminating_marker_catches_a_child_that_exits_cleanly_on_the_signal(
         'exit_if_terminating "${_srv_rc}"'
     )
     fallthrough = tmp_path / "fallthrough"
+    ready = tmp_path / "ready"
 
     stub = tmp_path / "clean_exit_child.py"
     stub.write_text(
-        "import signal, sys, time\n"
+        "import pathlib, signal, sys, time\n"
         "signal.signal(signal.SIGTERM, lambda s, f: sys.exit(0))\n"
+        f"pathlib.Path({str(ready)!r}).touch()\n"
         "time.sleep(30)\n",
         encoding="utf-8",
     )
@@ -1102,12 +1199,11 @@ def test_terminating_marker_catches_a_child_that_exits_cleanly_on_the_signal(
         ["bash", "-c", script], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
     )
     try:
-        time.sleep(0.5)
+        _wait_until_ready(ready)
         proc.terminate()
         proc.wait(timeout=15)
     finally:
-        proc.kill()
-        proc.wait(timeout=15)
+        _end(proc)
 
     assert not fallthrough.exists(), (
         "a child that exited 0 on the relayed signal was treated as a normal "

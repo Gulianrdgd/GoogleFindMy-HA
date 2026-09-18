@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import ast
 import importlib
+import json
 import logging
+import math
 import os
 import pathlib
 import platform
@@ -13,6 +15,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import time
 import uuid
 from types import SimpleNamespace
 from typing import Any
@@ -1025,17 +1028,110 @@ def test_terminate_matching_processes_tolerates_permission_errors(
     assert chrome_driver._terminate_matching_processes("chrome") == 0
 
 
+# The probe below spans three nested processes, each waiting on the next. Their
+# budgets are staggered on purpose: equal budgets would let the outermost fire
+# first every time, which kills only the outermost process and leaves the two
+# inner ones orphaned -- still signalling, and without their own diagnosis.
+_PGREP_VISIBILITY_TIMEOUT = 30.0
+_PROBE_CHAIN_TIMEOUT = 60
+_RELAY_TIMEOUT = _PROBE_CHAIN_TIMEOUT - 10
+_CLEANUP_TIMEOUT = _PROBE_CHAIN_TIMEOUT - 20
+_KILL_PROBE_DIR = pathlib.Path(__file__).resolve().parent / "fixtures" / "kill_probe"
+# The stranger has to stay alive until the cleanup asks pgrep, which is at worst
+# the visibility wait plus the outer chain budget. The two ``wait(timeout=10)``
+# calls afterwards only wait for its *death* and add nothing here. ``ceil``
+# rather than ``int`` so a fractional visibility budget cannot shrink the margin.
+_STRANGER_LIFETIME = math.ceil(_PGREP_VISIBILITY_TIMEOUT) + _PROBE_CHAIN_TIMEOUT + 60
+
+
+def _wait_until_pgrep_sees(
+    marker: str, pid: int, timeout: float = _PGREP_VISIBILITY_TIMEOUT
+) -> None:
+    """Block until ``pgrep -f marker`` reports *pid*, or fail saying exactly that.
+
+    ``Popen`` returns as soon as the child is forked, and until it reaches ``exec``
+    its command line is still the parent's, so it does not carry *marker* yet.
+    Searching inside that window finds nothing, which at the assertions below is
+    indistinguishable from "the cleanup spared it" -- the failure then blames the
+    ancestry filter for a process that was merely not visible yet.
+
+    This asks ``pgrep`` directly instead of going through
+    ``chrome_driver._pgrep_pids``: that helper is the code under test here, and a
+    wait built on it would fall silent together with it.
+    """
+
+    deadline = time.monotonic() + timeout
+    answers = 0
+    lookup_timeouts = 0
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            # Capped by the remaining budget: a fixed per-call timeout could
+            # outlast the deadline and replace the message below with a bare
+            # TimeoutExpired, which says nothing about visibility.
+            found = subprocess.run(  # noqa: S603 - fixed argv, generated marker
+                ["pgrep", "-f", marker],
+                capture_output=True,
+                text=True,
+                timeout=min(10.0, remaining),
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            # Measured on a loaded host (load average 17): pgrep itself can run
+            # for seconds. Counting these apart matters, because a run in which
+            # every lookup timed out never established anything about the
+            # process, and saying "never became visible" there would be a lie.
+            lookup_timeouts += 1
+            continue
+        answers += 1
+        if str(pid) in found.stdout.split():
+            return
+        time.sleep(0.05)
+    if answers == 0:
+        raise AssertionError(
+            f"pgrep never answered within {timeout}s ({lookup_timeouts} lookups "
+            f"timed out), so nothing is known about pid {pid}"
+        )
+    raise AssertionError(
+        f"the stranger (pid {pid}) never became visible to pgrep within {timeout}s "
+        f"({answers} answered lookups, {lookup_timeouts} timed out)"
+    )
+
+
+def _decode_probe_report(result: subprocess.CompletedProcess[str]) -> dict[str, Any]:
+    """Parse the cleanup child's JSON line, or fail naming what it printed.
+
+    The predecessor of this helper decoded ``result.stdout.strip() or "{}"``, so
+    a child that printed nothing yielded an empty mapping and the first assertion
+    below blamed the ancestry walk for a child that never got that far. Here a
+    silent child says so, and says what it wrote instead.
+    """
+
+    tail = result.stdout.strip().splitlines()[-1] if result.stdout.strip() else ""
+    try:
+        report = json.loads(tail)
+    except json.JSONDecodeError as exc:
+        raise AssertionError(
+            f"the cleanup child printed no usable report ({exc}); "
+            f"stdout={result.stdout!r} stderr={result.stderr!r}"
+        ) from exc
+    if not isinstance(report, dict):
+        raise AssertionError(f"the report is not an object: {report!r}")
+    return report
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX process semantics")
 @pytest.mark.skipif(shutil.which("pgrep") is None, reason="pgrep not available")
-def test_terminate_matching_processes_spares_its_own_grandparent(
-    tmp_path: Any,
-) -> None:
+def test_terminate_matching_processes_spares_its_own_grandparent() -> None:
     """End-to-end without mocks: the grandparent survives, a stranger dies.
 
-    Reproduction of the measured case, at its real depth. Only the *grandparent*
-    carries the marker in its argv: pytest -> CLI subprocess -> cleanup. The
-    grandchild runs the cleanup for that very marker, and before the fix this was
-    fatal (measured as exit 143 on a pytest run).
+    Reproduction of the measured case, at its real depth: pytest -> CLI
+    subprocess -> cleanup. Every level passes the marker on as an argument, so
+    every level carries it in its argv; what makes the case is the *distance*,
+    not marker scarcity. The grandchild runs the cleanup for that very marker,
+    and before the fix this was fatal (measured as exit 143 on a pytest run).
 
     The depth matters. A two-level version (parent -> child) would pass even with
     the whole ancestry walk deleted, because ``_protected_pids`` seeds itself with
@@ -1050,65 +1146,86 @@ def test_terminate_matching_processes_spares_its_own_grandparent(
     """
 
     marker = f"gfmy-kill-probe-{uuid.uuid4().hex}"
-    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-    # Level 3: runs the cleanup. Its argv does NOT carry the marker.
-    child = tmp_path / "child.py"
-    child.write_text(
-        "import sys\n"
-        f"sys.path.insert(0, {repo_root!r})\n"
-        "from custom_components.googlefindmy import chrome_driver\n"
-        "print(chrome_driver._terminate_matching_processes(sys.argv[1]))\n",
-        encoding="utf-8",
-    )
-    # Level 2: pure relay, marker-free argv, so the marked process is strictly
-    # the grandparent of the cleanup.
-    parent = tmp_path / "parent.py"
-    parent.write_text(
-        "import subprocess, sys\n"
-        "proc = subprocess.run([sys.executable, sys.argv[1], sys.argv[2]],\n"
-        "                      capture_output=True, text=True, timeout=60)\n"
-        "sys.stdout.write(proc.stdout)\n"
-        "sys.stderr.write(proc.stderr)\n"
-        "sys.exit(proc.returncode)\n",
-        encoding="utf-8",
-    )
-    # Level 1: the only process whose command line matches the marker.
-    grandparent = tmp_path / "grandparent.py"
-    grandparent.write_text(
-        "import subprocess, sys\n"
-        "proc = subprocess.run(\n"
-        "    [sys.executable, sys.argv[1], sys.argv[2], sys.argv[3]],\n"
-        "    capture_output=True, text=True, timeout=60)\n"
-        "sys.stdout.write(proc.stdout)\n"
-        "sys.stderr.write(proc.stderr)\n"
-        "sys.exit(proc.returncode)\n",
-        encoding="utf-8",
-    )
+    # The three links live in tests/fixtures/kill_probe/ so ruff reads them like
+    # any other test module. Level 3 (cleanup.py) runs the cleanup for a marker
+    # its own argv carries too and reports the very calls that decided the
+    # kill. Levels 1 and 2 are the same relay script with staggered budgets:
+    # the outermost link is the one only a complete ancestry walk can reach,
+    # the middle one buys the distance to the cleanup. The marker travels down
+    # from the outermost link, which is why every link carries it.
+    relay = str(_KILL_PROBE_DIR / "relay.py")
+    cleanup = str(_KILL_PROBE_DIR / "cleanup.py")
 
-    sleeper = "import sys, time; time.sleep(30)"
+    sleeper = f"import sys, time; time.sleep({_STRANGER_LIFETIME})"
     stranger = subprocess.Popen(  # noqa: S603 - fixed interpreter, generated marker
         [sys.executable, "-c", sleeper, marker],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
     try:
-        # Only the grandparent's argv carries the marker, so pgrep returns it and
-        # nothing but the ancestry walk keeps it alive.
+        _wait_until_pgrep_sees(marker, stranger.pid)
+        # pgrep returns the whole three-level chain plus the stranger (measured:
+        # four). Nothing but the ancestry walk keeps the chain alive.
         result = subprocess.run(  # noqa: S603 - fixed interpreter, generated files
-            [sys.executable, str(grandparent), str(parent), str(child), marker],
+            [
+                sys.executable,
+                relay,
+                str(_RELAY_TIMEOUT),
+                relay,
+                str(_CLEANUP_TIMEOUT),
+                cleanup,
+                marker,
+                str(stranger.pid),
+            ],
             capture_output=True,
             text=True,
-            timeout=60,
+            timeout=_PROBE_CHAIN_TIMEOUT,
             check=False,
         )
 
-        assert result.returncode == 0, (
+        assert result.returncode != -signal.SIGTERM, (
             "the grandparent was killed by its own grandchild: "
             f"rc={result.returncode} stderr={result.stderr}"
         )
-        assert int(result.stdout.strip() or 0) >= 1, (
-            f"the stranger should have been signalled, output was {result.stdout!r}"
+        assert result.returncode == 0, (
+            "the probe chain failed before it could report; this is not a kill "
+            "(that is the assertion above) but a broken child. "
+            f"rc={result.returncode} stdout={result.stdout!r} stderr={result.stderr}"
+        )
+        report = _decode_probe_report(result)
+        assert report.get("protected") is not None, (
+            "the ancestry walk bailed out, so the cleanup skipped every process "
+            "without looking at one; this is not 'the stranger survived'. "
+            f"report={report}"
+        )
+        assert report.get("protected", -1) >= 4, (
+            "the ancestry the cleanup actually used is shorter than the four "
+            "entries this construction guarantees (cleanup, relay, grandparent, "
+            "and whatever started the chain), so the walk stopped early; -1 means "
+            "it was never run. Length alone does not prove the grandparent was in "
+            "it -- that is what the return code above shows. "
+            f"report={report}"
+        )
+        assert report.get("pgrep_calls") == 1, (
+            "the cleanup looked up the candidates more than once, so the counts "
+            f"below describe the last lookup, not the deciding one. report={report}"
+        )
+        assert report.get("seen") == 4, (
+            "pgrep did not return exactly the four marked processes (grandparent, "
+            "relay, cleanup, stranger). Three things carry that number, and a "
+            "failure here means one of them broke: the marker is a fresh uuid so "
+            "nothing foreign can join, the stranger outlives the whole probe by "
+            "_STRANGER_LIFETIME so it cannot drop out, and pgrep excludes its own "
+            "marker-bearing argv. "
+            f"report={report}"
+        )
+        assert report.get("stranger_seen") is True, (
+            "the stranger was not among the candidates, so sparing it proves "
+            f"nothing about the ancestry filter. report={report}"
+        )
+        assert report.get("signalled") == 1, (
+            f"the stranger should have been signalled exactly once, report={report}"
         )
         assert stranger.wait(timeout=10) != 0
     finally:
