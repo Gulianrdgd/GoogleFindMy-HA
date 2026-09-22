@@ -2809,6 +2809,85 @@ async def test_async_ttl_policy_ignores_very_short_ttl_in_recalibration() -> Non
     await _run()
 
 
+async def test_async_ttl_policy_forced_probe_ignores_too_young_token() -> None:
+    """A 401 on an armed probe must not record a sub-minimum age as the TTL.
+
+    Regression for a field log: a 401 one minute after a refresh (propagation
+    delay) hit an armed probe and was stored as "measured TTL: 1.0 min", after
+    which the token was refreshed on every poll cycle instead of every ~13 h.
+    The probe must stay armed so the next genuine expiry is measured.
+    """
+    hass = _FakeHass()
+    cache = await TokenCache.create(hass, "entry-young-probe")
+    try:
+
+        async def _cache_get(key: str) -> Any:
+            return await cache.get(key)
+
+        async def _cache_set(key: str, value: Any) -> None:
+            await cache.set(key, value)
+
+        async def _refresh() -> str:
+            return "fresh-token"
+
+        policy = AsyncTTLPolicy(
+            username="user@example.com",
+            logger=logging.getLogger("test_young_probe"),
+            get_value=_cache_get,
+            set_value=_cache_set,
+            refresh_fn=_refresh,
+            set_auth_header_fn=lambda _: None,
+            ns_prefix="entry-young-probe",
+        )
+
+        original_ttl = 801.4 * 60
+        await cache.set(policy.k_bestttl, original_ttl)
+        await cache.set(policy.k_armed, 1)
+        await cache.set(policy.k_issued, time.time() - 60)
+
+        await policy.async_on_401(adaptive_downshift=True)
+
+        assert await cache.get(policy.k_bestttl) == original_ttl
+        assert await cache.get(policy.k_armed) == 1
+    finally:
+        await cache.close()
+
+
+def test_sync_ttl_policy_forced_probe_ignores_too_young_token() -> None:
+    """Sync twin of the async forced-probe floor test."""
+
+    store: dict[str, Any] = {}
+
+    def _get(key: str) -> Any:
+        return store.get(key)
+
+    def _set(key: str, value: Any) -> None:
+        if value is None:
+            store.pop(key, None)
+        else:
+            store[key] = value
+
+    policy = TTLPolicy(
+        username="user@example.com",
+        logger=logging.getLogger("test_sync_young_probe"),
+        get_value=_get,
+        set_value=_set,
+        refresh_fn=lambda: "fresh-token",
+        set_auth_header_fn=lambda _: None,
+        ns_prefix="entry-sync-young-probe",
+    )
+
+    original_ttl = 801.4 * 60
+    store[policy.k_bestttl] = original_ttl
+    store[policy.k_armed] = 1
+    store[policy.k_issued] = time.time() - 60
+
+    policy.on_401(adaptive_downshift=True)
+
+    assert store[policy.k_bestttl] == original_ttl
+    assert store[policy.k_armed] == 1
+
+
 async def test_async_ttl_policy_accepts_legitimate_short_ttl_above_threshold() -> None:
     """TTLs above the minimum threshold should still trigger recalibration.
 

@@ -887,7 +887,17 @@ class TTLPolicy:
         age_min = age_sec / 60.0
         planned_probe = bool(self._get(self.k_armed))
 
-        if planned_probe:
+        if planned_probe and age_sec < self.MIN_TTL_FOR_LEARNING_SEC:
+            # A token this young did not expire; the 401 is a propagation or
+            # refresh artifact. Recording it would pin the learned TTL near
+            # zero and force a refresh on every request. Keep the probe armed
+            # so the next genuine expiry is measured instead.
+            self.log.info(
+                "Got 401 (forced probe) after %.1f min – too young to be an expiry; "
+                "not recording it as the TTL.",
+                age_min,
+            )
+        elif planned_probe:
             self.log.info("Got 401 (forced probe) – measured TTL: %.1f min.", age_min)
             self._set(self.k_bestttl, age_sec)  # always accept probe (up or down)
             self._set(self.k_armed, 0)  # coalesce multiple 401 in same probe window
@@ -1273,7 +1283,15 @@ class AsyncTTLPolicy(TTLPolicy):
             age_min = age_sec / 60.0
             planned_probe = bool(await self._aget(self.k_armed))
 
-            if planned_probe:
+            if planned_probe and age_sec < self.MIN_TTL_FOR_LEARNING_SEC:
+                # See TTLPolicy.on_401: a token this young did not expire, so the
+                # 401 is not a TTL measurement. Keep the probe armed.
+                self.log.info(
+                    "Got 401 (forced probe) after %.1f min – too young to be an expiry; "
+                    "not recording it as the TTL.",
+                    age_min,
+                )
+            elif planned_probe:
                 self.log.info(
                     "Got 401 (forced probe) – measured TTL: %.1f min.", age_min
                 )
