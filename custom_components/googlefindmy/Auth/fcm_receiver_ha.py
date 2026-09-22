@@ -2769,7 +2769,7 @@ class FcmReceiverHA:
         fanout_targets: int,
     ) -> None:
         """Log the push receipt with routing context."""
-        _LOGGER.info(
+        _LOGGER.debug(
             "push_received(entry=%s, device=%s, fanout_targets=%d, route=%s)",
             ",".join(sorted(target_entries)) if target_entries else "unknown",
             canonic_id[:8],
@@ -4424,7 +4424,7 @@ class FcmReceiverHA:
                     )
 
             if token is not None:
-                _LOGGER.info(
+                _LOGGER.debug(
                     "[entry=%s] Manual locate registration ready for %s",
                     entry_id,
                     canonic_id[:8],
