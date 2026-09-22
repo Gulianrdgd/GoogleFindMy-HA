@@ -197,6 +197,52 @@ MAX_AUTH_DEADLINE_WAITS = 8
 
 MAX_PAYLOAD_BYTES = 512 * 1024  # 512 KiB
 
+# Action fields of ExecuteActionType (DeviceUpdate.proto). locateTracker (30) and
+# startSound (31) differ by a single bit in their serialized tag (0xF2 vs 0xFA).
+EXECUTE_ACTION_FIELDS = ("locateTracker", "startSound", "stopSound")
+
+
+class NovaPayloadIntegrityError(ValueError):
+    """The bytes about to be sent do not carry the action the caller built."""
+
+
+def _assert_payload_action(payload: bytes, expected_action: str) -> None:
+    """Refuse to send an ExecuteActionRequest whose action is not ``expected_action``.
+
+    Decodes the exact bytes handed to the transport and requires that exactly
+    the expected action field is present. Guards the spurious-ring reports
+    (BSkando#211 / #222): a locate payload must never reach Google carrying
+    ``startSound``.
+
+    Raises:
+        NovaPayloadIntegrityError: If the payload does not decode, or carries any
+            action other than (or in addition to) ``expected_action``.
+    """
+    device_update_pb2 = import_module(
+        "custom_components.googlefindmy.ProtoDecoders.DeviceUpdate_pb2"
+    )
+    request = device_update_pb2.ExecuteActionRequest()
+    try:
+        request.ParseFromString(payload)
+    except Exception as err:  # noqa: BLE001 - any decode failure is a refusal
+        _LOGGER.error(
+            "Nova payload integrity check failed: payload does not decode; "
+            "request NOT sent"
+        )
+        raise NovaPayloadIntegrityError("Nova payload does not decode") from err
+    present = [f for f in EXECUTE_ACTION_FIELDS if request.action.HasField(f)]
+    if present != [expected_action]:
+        _LOGGER.error(
+            "Nova payload integrity check failed: expected action %s, payload "
+            "carries %s; request NOT sent",
+            expected_action,
+            present or "no action",
+        )
+        raise NovaPayloadIntegrityError(
+            f"Nova payload carries {present}, expected [{expected_action!r}]"
+        )
+
+
 # --- Retry helpers ---
 
 
@@ -1347,6 +1393,8 @@ async def async_nova_request(  # noqa: PLR0913,PLR0912,PLR0915
     namespace: str | None = None,
     # Entry-scoped TokenCache for strict multi-account separation
     cache: TokenCache | None = None,
+    # Action the payload must carry; checked on the final bytes before each send
+    expected_action: str | None = None,
 ) -> str:
     """
     Asynchronous Nova API request for Home Assistant (entry-scoped capable).
@@ -1375,12 +1423,18 @@ async def async_nova_request(  # noqa: PLR0913,PLR0912,PLR0915
             (e.g. via `async_get_adm_token_isolated(...)`).
         namespace: Optional key namespace (e.g., config entry_id) to avoid cache collisions.
         cache: Optional entry-scoped TokenCache for strict multi-account separation.
+        expected_action: Optional ExecuteActionType field name (for example
+            ``"locateTracker"``). When set, the exact bytes are decoded right
+            before every send attempt and the request is refused unless that
+            action, and only that action, is present.
 
     Returns:
         Hex-encoded response body.
 
     Raises:
         ValueError: if the hex_payload is invalid or username is unavailable.
+        NovaPayloadIntegrityError: if ``expected_action`` is set and the payload
+            does not carry exactly that action. Nothing is sent.
         NovaAuthError: on non-retryable 4xx client errors; use
             is_credential_rejection to tell a credential rejection from a
             rejected request.
@@ -1542,6 +1596,8 @@ async def async_nova_request(  # noqa: PLR0913,PLR0912,PLR0915
                 timeout = aiohttp.ClientTimeout(
                     total=NOVA_REQUEST_TOTAL_TIMEOUT_S, connect=10, sock_read=30
                 )
+                if expected_action is not None:
+                    _assert_payload_action(payload, expected_action)
                 async with session.post(
                     url,
                     headers=headers,

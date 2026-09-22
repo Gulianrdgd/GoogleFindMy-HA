@@ -979,6 +979,7 @@ async def get_location_data_for_device(  # noqa: PLR0912, PLR0913, PLR0915
                 refresh_override=refresh_override,
                 namespace=resolved_namespace,
                 cache=cache_ref,  # pass entry-scoped TokenCache through
+                expected_action="locateTracker",
             )
         except asyncio.CancelledError:
             raise
