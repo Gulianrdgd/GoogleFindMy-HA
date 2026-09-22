@@ -20,12 +20,14 @@
     - [Shared pip cache for stub installs](#shared-pip-cache-for-stub-installs)
   - [1) What must be in **every** PR (lean checklist)](#1-what-must-be-in-every-pr-lean-checklist)
   - [Home Assistant version & dependencies](#home-assistant-version--dependencies)
+    - [Poetry lock file management](#poetry-lock-file-management)
   - [Maintenance mode](#maintenance-mode)
     - [Config subentry maintenance helper](#config-subentry-maintenance-helper)
   - [Key material and resolver hypotheses](#key-material-and-resolver-hypotheses)
     - [Where key material comes from](#where-key-material-comes-from)
     - [Wrapped EIK hypothesis](#wrapped-eik-hypothesis)
     - [Timebase hypotheses](#timebase-hypotheses)
+    - [Owner-key error taxonomy (classify only from positive evidence)](#owner-key-error-taxonomy-classify-only-from-positive-evidence)
   - [2) Roles (right-sized)](#2-roles-right-sized)
     - [2.1 Contributor (implementation) — **accountable for features/fixes/refactors**](#21-contributor-implementation--accountable-for-featuresfixesrefactors)
     - [2.2 Reviewer (maintainer/agent) — **accountable for correctness**](#22-reviewer-maintaineragent--accountable-for-correctness)
@@ -153,6 +155,7 @@ Always keep any `from __future__` imports immediately after the module docstring
 * [`docs/AI_DEPRECATIONS_GUIDE.md`](docs/AI_DEPRECATIONS_GUIDE.md) — Core 2025.10 through 2026.9 technical migration playbook for deprecations, breaking changes, and behavioral shifts. Treat its critical checklist as mandatory when touching affected APIs.
   * Section VI of [`docs/CONFIG_SUBENTRIES_HANDBOOK.md`](docs/CONFIG_SUBENTRIES_HANDBOOK.md) ("Troubleshooting `ValueError` & Regressions") carries the device/entity registry troubleshooting playbooks. Reference them whenever you touch `_async_setup_subentry`, registry rebuild services, or device cleanup helpers, and summarize the relevant diagnostics in your PR description. For device *ownership* changes read `docs/AI_DEPRECATIONS_GUIDE.md`, section VI, first: from Core 2026.8 a device belongs to a single config entry and a single subentry, and the old keywords changed meaning rather than name.
 * **Self-healing helpers:** `_async_self_heal_duplicate_entities()` in `custom_components/googlefindmy/__init__.py` documents the existing duplicate-entity cleanup flow; review it alongside the new `EntityRecoveryManager` when designing additional recovery logic.
+* **Architecture orientation (third party):** [GitDiagram](https://gitdiagram.com/bskando/googlefindmy-ha) draws an interactive map of `BSkando/GoogleFindMy-HA`, the upstream repository the HACS badge, `manifest.json` and `pyproject.toml` point at: the config flow, the coordinator, the `Auth` package, the `device_tracker` platform and the `NovaApi`/`SpotApi` clients, and how they connect. Handy before you open `custom_components/googlefindmy/` for the first time. An external service generates it from the upstream tree and serves it from a cache, so a first visit may have to build it, and work that has not landed upstream does not show up in it. Orientation only: the nested `AGENTS.md` files and the documents under `docs/` remain authoritative.
 
 ### Home Assistant helper signature changelog
 
@@ -706,12 +709,16 @@ For any work that migrates entity-registry records during reload/startup flows, 
 
 ## 5) Security & privacy guards
 
-* **Never log** tokens, email addresses, precise coordinates, device IDs, or raw API payloads.
+* **Never log** tokens, email addresses, precise coordinates, raw API payloads, or class (c) identifiers in clear text. Device identifiers are graded by one question: *can somebody who holds only the log file use the value without owning this Home Assistant instance or this Google account?*
+  * (a) **Rotating identifiers** (EID, the `request_uuid` this integration generates, the BLE MAC of an FMDN advertisement that resolved to one of the user's own trackers, which rotates with the EID, or once per 24 h while unwanted-tracking mode is active, `docs/FMDN.md` S3.5): allowed at any level, in full or truncated. The MAC of an advertisement that did not resolve belongs to somebody else's tracker until proven otherwise and is class (c); a caller-supplied value (the `stop_sound` service accepts a `request_uuid`) is graded by its content, not by the parameter name; the EID is truncated by convention (`EID_LOG_PREFIX_LENGTH` in `fmdn_finder/`: 8 hex chars of `eid_hex`, 8 bytes of the raw `eid`). Truncation does not turn a stable value into class (a): a prefix or suffix of a class (b) or (c) identifier keeps its class, and class (c) may only appear in the masked form defined under (c).
+  * (b) **Registry identifiers of this instance** (`entry_id`, `config_subentry_id`, Home Assistant `device_id`) and the Google canonical ids of the user's own trackers: allowed at any level, they carry no meaning outside this instance and this account. User-provided device names are derived information (see "Redact rigorously" below). A record that can repeat unattended (polling, transport recovery, background sweeps, state-change listeners) keeps the name out of the record at INFO and above and carries it only at DEBUG; a count, an index or a class (a)/(b) identifier may stand in its place, none of them is required. The locate transport pins the Name@DEBUG half at WARNING as "Count@WARNING, Name@DEBUG" (`test_location_request_r6_name_sweep.py`), and `tests/test_guard_logging_entity_ids.py` pins the `entity_id` form package-wide at INFO and above. A record bound to one invocation (a manual locate, a button press, a service call) may name the device at any level, because the caller asked for that device by name and has to see which one failed. An automation can repeat an invocation, so a new invocation-bound record prefers the count-or-index form unless the name is what the operator has to act on; the name-carrying records above DEBUG that exist today, on the locate transport and on the poll path alike, are a documented exception, not a template, and are reduced as they are touched. A device name is the operator's own label inside the operator's own instance; the PII ban (section 1, "Behavioral safety") covers data about persons that the integration handles (e-mail addresses, account identifiers, coordinates), it does not turn every label into PII. A label that names a person other than the operator is class (c) once the log leaves the instance; the operator redacts it before attaching a log, because the integration cannot know which labels are personal. An `entity_id` is a slug of that name and follows the same rule.
+  * (c) **Hardware addresses** (BLE or Wi-Fi MAC of scanners, proxies, phones), stable identifiers of third parties (foreign trackers, other accounts) and clear-text identifiers of anybody who is not the operator: never in clear text. The permitted masked forms are the masking helpers for e-mail and account values (`_mask_email_for_logs`, `_redact_account_for_log`) and, for addresses, the last four characters (`AA:BB:CC:DD:EE:FF` becomes `...E:FF`, `_mask_address_for_logs` in `fmdn_finder/location_uploader.py`); any longer part of the value is clear text.
+  * When in doubt, treat a value as (c): a log file leaves the operator's control the moment it is attached to an issue, and a stable identifier is still valid years later, while a rotating one is stale before anybody reads it.
 * **Diagnostics redaction:** use a central `TO_REDACT` list in `diagnostics.py`.
 * **HTTP views & map tokens:** no secrets in URLs; server-side validation; short-lived, entry-scoped tokens.
 * **Data minimization:** store only what is necessary (HA Store); document retention in README.
 * **Network:** set timeouts; use backoff; fail closed on uncertainty.
-* **Redact rigorously:** ensure not only direct secrets but also potentially identifying **derived information** (e.g., user-provided device names if sensitive, correlated external IDs) are redacted from logs and diagnostics.
+* **Redact rigorously:** ensure not only direct secrets but also potentially identifying **derived information** (e.g., user-provided device names if sensitive, correlated external IDs) are redacted from diagnostics and from log records that can repeat unattended at INFO and above (the name at DEBUG only, see the graded rule above); a record bound to one invocation may name the device.
 
 ---
 
@@ -722,7 +729,7 @@ Prioritize a small but protective suite:
 1. **Config flow** — user flow (success/invalid), duplicate abort (`async_set_unique_id` + `_abort_if_unique_id_configured`), connectivity pre-check, **reauth** (success/failure → reload on success), **reconfigure** step.
 2. **Lifecycle** — `async_setup_entry`, `async_unload_entry`, **reload** (no zombie listeners; entities reattach cleanly).
 3. **Coordinator & availability** — happy path; transient errors raise `UpdateFailed`; entities flip to `unavailable`; single “down/back” log.
-4. **Diagnostics** — `diagnostics.py` returns data with strict **redaction** (no tokens/emails/locations/IDs).
+4. **Diagnostics** — `diagnostics.py` returns data with strict **redaction** (no tokens/emails/locations; device, canonical and EID keys go through `TO_REDACT`, the instance's own `entry_id` stays, section 5 class (b)).
 5. **Services** — success/error paths with localized messages; throttling/rate-limits where applicable.
 6. **Discovery & dynamic devices** (if supported) — announcement, IP update, add/remove devices post-setup.
 7. **Token cache** — expiry detection, refresh, failure propagation, no hidden fallbacks (§4).
@@ -803,11 +810,11 @@ Add to the PR description:
   > interactive stub-install prompt; no separate step scans the logs for the flag.
 
 > **Hassfest runs in CI.** The `.github/workflows/hassfest-auto-fix.yml` workflow
-> validates manifests on every PR and on pushes to `main`, auto-committing any key
+> validates manifests on every PR, auto-committing any key
 > ordering fixes (the blocking manifest gate is the `hassfest` job in `ci.yml`).
 > Review the workflow output instead of attempting a local run; when you need a
-> fresh validation, use the **Run workflow** button in the Actions tab or re-run
-> the job from the PR UI.
+> fresh validation, re-run the job from the PR UI (the workflow has no
+> `workflow_dispatch` trigger).
 
 ### 10.1 Type-checking policy — mypy strict on edited Python files
 
@@ -895,7 +902,7 @@ artifacts remain exempt when explicitly flagged by repo configuration).
 
 **Logging & privacy**
 
-* **Redact** tokens, PII, coordinates, device IDs.
+* **Redact** tokens, PII, coordinates, and class (c) identifiers (section 5); class (b) identifiers may appear at any level.
 * Use a central redaction list in diagnostics; keep logs actionable yet non-sensitive.
 
 **Supply chain**
@@ -932,18 +939,54 @@ artifacts remain exempt when explicitly flagged by repo configuration).
     guarded by `if: github.event_name != 'pull_request'`) opens automated
     security-update PRs via `peter-evans/create-pull-request` for fixable
     advisories.
-  * **Semgrep SAST runs on PRs only.** `.github/workflows/semgrep.yml` declares
-    `push`, `pull_request`, two daily `schedule` crons and `workflow_dispatch`,
-    but its sole job is guarded by `if: github.event_name == 'pull_request'`, so
-    scheduled, push and manual runs skip the scan.
+  * **Semgrep SAST runs on PRs only.** `.github/workflows/semgrep.yml` triggers
+    on `pull_request` alone and scans the PR head against its base commit
+    (`--baseline-commit`). Semgrep resolves the baseline to
+    `git merge-base <base> HEAD`, which on the `pull_request` merge ref equals
+    `base.sha`, so commits that reached the base branch after the PR branched
+    are not attributed to the PR. The full-tree scan of `main` is CodeQL's job
+    (next bullet). Its gate step fails the job on any new finding of severity
+    `ERROR`, `HIGH` or `CRITICAL` (both Semgrep severity scales); `WARNING`,
+    `MEDIUM` and below are uploaded to the Security tab but do not fail the job.
+    The gate only counts what the scan produced: a scan that itself fails
+    (Semgrep exit code 2, e.g. registry unreachable) uploads an empty artifact
+    with a `::notice` and leaves the job green.
+  * **CodeQL scans the full tree.** `.github/workflows/codeql.yml` (advanced
+    setup) analyzes `python` and `actions` on the merge ref of every
+    `pull_request`, on every `push` to `main`, and on a weekly `schedule`;
+    an inline `paths-ignore` excludes generated `*_pb2*.py` modules and
+    `custom_components/googlefindmy/vendor/`. Results upload under the SARIF
+    categories `/language:python` and `/language:actions`. The pass/fail
+    verdict of the PR check is not decided by the workflow file: it comes from
+    the repository's code scanning setting "check failure" (newly introduced
+    alerts of error level or high/critical security severity). Merging into
+    `main` IS blocked on CodeQL: the repository ruleset on `main` (`gh api
+    repos/<owner>/<repo>/rules/branches/main`) carries a `code_scanning` rule
+    for the tool `CodeQL` (`security_alerts_threshold: high_or_higher`,
+    `alerts_threshold: errors`), which blocks the merge while the analysis is
+    pending, when no CodeQL analysis exists for the merge ref, or when the PR
+    introduces alerts at or above those thresholds (repository admins can
+    bypass via the PR bypass path, like every rule of that ruleset). Measured
+    on 2026-09-17 with probe PR #1299 (two new CodeQL alerts, `error`/`high`;
+    `CI Success` green; merge state `BLOCKED`) against control PR #1300 (no
+    new alerts; `CLEAN`).
   * **Not every change is human-reviewed.** `.github/workflows/release-stamp.yml`
-    can push a version stamp directly to the owning branch (or auto-merge a
-    fallback PR after status checks, without a required review), and
+    can push a version stamp directly to the owning branch (or, when branch
+    rules reject the direct push, step "Resolve the owning branch and push the
+    stamp" opens a stamp PR that a maintainer merges by hand; no review
+    requirement), and
     `.github/workflows/hassfest-auto-fix.yml` commits manifest key-sorts via
     `stefanzweifel/git-auto-commit-action`. Human review is the norm for feature
-    PRs, not a guarantee on every commit.
-  * **A narrow manifest CVE gate does block PRs.** The required `test` job
-    (`.github/workflows/ci.yml`, `poetry run pytest`) runs
+    PRs, not a guarantee on every commit. Known limit: when
+    `hassfest-auto-fix.yml` pushes a sort commit onto a PR head with
+    `GITHUB_TOKEN`, GitHub creates the `pull_request` runs for that commit "in an
+    approval-required state" (docs: actions/concepts/security/github_token), so
+    `CI Success` is missing until a maintainer approves the runs in the Actions
+    UI or the author pushes again.
+  * **A narrow manifest CVE gate does block PRs.** The `test` job
+    (`.github/workflows/ci.yml`, `poetry run pytest`), aggregated into the
+    required `CI Success` check (job `ci-success`, `needs:` all CI jobs;
+    required by the repository ruleset on `main`), runs
     `tests/test_pip_audit_security.py::TestManifestOnlyPipAuditGate::test_no_fixable_integration_owned_vulnerability`,
     which fails the PR when `script/audit_manifest.py` finds an actionable,
     fixable, integration-owned manifest or transitive-dependency vulnerability
@@ -960,9 +1003,10 @@ artifacts remain exempt when explicitly flagged by repo configuration).
     behaviour, not its declared intent.
   * **Negative** ("there is **no** X", "not enforced", "does not block"): before
     asserting an absence, search for the counterexample that would falsify it,
-    and treat a **gate embedded in the required `test` job** (a pytest test that
-    fails the PR) as a real gate even when no dedicated workflow exists. A false
-    "no gate" is the same drift as a false "gate exists".
+    and treat a **gate embedded in the `test` job behind the required
+    `CI Success` check** (a pytest test that fails the PR) as a real gate even
+    when no dedicated workflow exists. A false "no gate" is the same drift as
+    a false "gate exists".
   * **Scope / quantifier** ("scoped to X", "**only** X", "**every** / **all**
     X"): enumerate the full set (e.g. grep every entry in `requirements.txt`,
     not just the named packages) and check the stated boundary against it. State
@@ -1026,7 +1070,7 @@ artifacts remain exempt when explicitly flagged by repo configuration).
 
 ### 11.8 Release & operations
 
-* CI **security gate**: lint/type/tests must pass; the required `test` job enforces a **narrow** manifest CVE gate (the `test_no_fixable_integration_owned_vulnerability` pytest gate over `audit_manifest`), while the separate `pip-audit` workflow runs report-only; a broad full-tree CVE scan and an SBOM scan remain hardening targets, not yet enforced.
+* CI **security gate**: lint/type/tests must pass and roll up into `CI Success`, a required status check of the `main` ruleset (together with the `code_scanning` rule for CodeQL); the `test` job enforces a **narrow** manifest CVE gate (the `test_no_fixable_integration_owned_vulnerability` pytest gate over `audit_manifest`), while the separate `pip-audit` workflow runs report-only; a broad full-tree CVE scan and an SBOM scan remain hardening targets, not yet enforced.
 * Logs are **incident-ready** but privacy-preserving (use OWASP vocabulary).
 * All doc updates comply with **Rule §9.DOC**.
 
@@ -1037,8 +1081,8 @@ artifacts remain exempt when explicitly flagged by repo configuration).
 * [ ] No `eval/exec`; subprocess without `shell=True`; parameterized I/O; safe loaders.
 * [ ] Archive extraction is traversal-safe; paths validated with `pathlib`.
 * [ ] `secrets` used for tokens; cryptography aligns with BSI TR-02102-1 guidance.
-* [ ] Logs/diagnostics redact tokens, PII, coordinates, device IDs, and derived identifiers.
-* [ ] The **whole runtime stack** uses `>=` floors (the Chrome/ChromeDriver-currency rationale is what is scoped to the browser packages, not hard pins across the stack); **most test/tooling** deps also use `>=` floors, only a constrained subset is exact-pinned (`pytest-asyncio==1.3.0`, `constraints-test-stubs.txt`); the required `test` job enforces a **narrow** manifest CVE gate (`test_no_fixable_integration_owned_vulnerability`), the separate `pip-audit` workflow runs report-only on PRs + weekly auto-update PRs; Semgrep SAST runs on PRs only (job guarded to `pull_request`); not every change is human-reviewed (release-stamp/hassfest-auto-fix auto-commit); a broad full-tree CVE scan and an SBOM scan remain hardening targets.
+* [ ] Logs redact tokens, PII, coordinates and class (c) identifiers (section 5) at every level, and derived identifiers (user-provided names, `entity_id`) from records that can repeat unattended at INFO and above; diagnostics redact device, canonical and EID keys through `TO_REDACT` (the instance's own `entry_id` is class (b) and stays).
+* [ ] The **whole runtime stack** uses `>=` floors (the Chrome/ChromeDriver-currency rationale is what is scoped to the browser packages, not hard pins across the stack); **most test/tooling** deps also use `>=` floors, only a constrained subset is exact-pinned (`pytest-asyncio==1.3.0`, `constraints-test-stubs.txt`); the `test` job (behind the required `CI Success` check of the `main` ruleset) enforces a **narrow** manifest CVE gate (`test_no_fixable_integration_owned_vulnerability`), the separate `pip-audit` workflow runs report-only on PRs + weekly auto-update PRs; Semgrep SAST runs on PRs only (workflow triggers on `pull_request` alone, baseline scan against the PR base, gate fails on new `ERROR`/`HIGH`/`CRITICAL` findings); CodeQL scans the full tree (PR merge ref, push to `main`, weekly) and blocks merges into `main` via the ruleset's `code_scanning` rule; not every change is human-reviewed (release-stamp/hassfest-auto-fix auto-commit); a broad full-tree CVE scan and an SBOM scan remain hardening targets.
 * [ ] Async: no loop blockers; `to_thread`/`TaskGroup`; proper cancel handling.
 * [ ] I/O optimized (batch/atomic); caches with clear TTL/invalidations.
 * [ ] HA-specific: Coordinator, injected session, `get_url`, config-flow test, Repairs/Diagnostics, HA Store.
