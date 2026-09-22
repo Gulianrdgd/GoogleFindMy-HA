@@ -94,6 +94,7 @@ from custom_components.googlefindmy.location_row_markers import (
     strip_transient_keys,
     substitute_zone_accuracy,
 )
+from custom_components.googlefindmy.NovaApi import request_audit
 from custom_components.googlefindmy.NovaApi.ExecuteAction.LocateTracker.decrypt_locations import (
     DecryptionError,
     OwnerKeyLookupTransientError,
@@ -2657,6 +2658,7 @@ class FcmReceiverHA:
                 canonic_id[:8],
                 len(hex_string),
             )
+            request_audit.note_unsolicited_push(canonic_id, hex_string)
 
             tracked = [
                 c for c in target_coordinators if self._is_tracked(c, canonic_id)

@@ -72,6 +72,33 @@ except ImportError:  # pragma: no cover - ConfigEntryError introduced in newer c
     ConfigEntryError = HomeAssistantError
 
 
+def _log_play_sound_origin(call: ServiceCall, device_id: str) -> None:
+    """Log who triggered a Play Sound, from the Home Assistant call context.
+
+    Investigation aid for spurious rings (BSkando#211 / #222): a user id means a
+    person (dashboard, app, button); a parent id without a user means an
+    automation or script; neither means the call came from inside Home Assistant.
+    """
+    context = getattr(call, "context", None)
+    user_id = getattr(context, "user_id", None) or ""
+    parent_id = getattr(context, "parent_id", None) or ""
+    context_id = getattr(context, "id", None) or ""
+    if user_id:
+        source = "user"
+    elif parent_id:
+        source = "automation_or_script"
+    else:
+        source = "system"
+    _LOGGER.info(
+        "Play Sound requested for device %s: source=%s user=%s context=%s parent=%s",
+        str(device_id)[:8],
+        source,
+        user_id[:8] or "none",
+        context_id[:8] or "none",
+        parent_id[:8] or "none",
+    )
+
+
 def _service_validation_error(
     message: str,
     *,
@@ -953,6 +980,7 @@ async def async_register_services(hass: HomeAssistant, ctx: dict[str, Any]) -> N
                 translation_key="device_not_found",
                 translation_placeholders=placeholders,
             )
+        _log_play_sound_origin(call, raw_device_id)
         try:
             runtime, canonical_id = await _resolve_runtime_for_device_id(raw_device_id)
             outcome = await runtime.coordinator.async_play_sound(canonical_id)

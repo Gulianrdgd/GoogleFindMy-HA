@@ -50,6 +50,7 @@ from custom_components.googlefindmy.Auth.username_provider import (
     async_get_username,
     username_string,
 )
+from custom_components.googlefindmy.NovaApi import request_audit
 
 # Import google.rpc.Status for decoding Google API error responses.
 # Prefer the official googleapis-common-protos package; fall back to the
@@ -1598,6 +1599,7 @@ async def async_nova_request(  # noqa: PLR0913,PLR0912,PLR0915
                 )
                 if expected_action is not None:
                     _assert_payload_action(payload, expected_action)
+                    request_audit.record_sent(payload)
                 async with session.post(
                     url,
                     headers=headers,

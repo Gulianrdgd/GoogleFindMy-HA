@@ -166,6 +166,7 @@ async def async_submit_stop_sound_request(  # noqa: PLR0913
             refresh_override=refresh_override,
             namespace=resolved_namespace,
             cache=cache,
+            expected_action="stopSound",
         )
     except (
         asyncio.CancelledError,

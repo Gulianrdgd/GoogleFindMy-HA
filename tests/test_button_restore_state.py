@@ -86,7 +86,11 @@ async def test_button_records_last_pressed_on_press() -> None:
 
     assert button._attr_last_pressed is not None
     service_call.assert_awaited_once_with(
-        DOMAIN, SERVICE_PLAY_SOUND, {"device_id": "device-1"}, blocking=True
+        DOMAIN,
+        SERVICE_PLAY_SOUND,
+        {"device_id": "device-1"},
+        blocking=True,
+        context=getattr(button, "_context", None),
     )
 
 

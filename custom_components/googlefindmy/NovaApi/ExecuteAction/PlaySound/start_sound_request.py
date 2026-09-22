@@ -178,6 +178,7 @@ async def async_submit_start_sound_request(  # noqa: PLR0913
             refresh_override=refresh_override,
             namespace=resolved_namespace,
             cache=cache_ref,
+            expected_action="startSound",
         )
         return (response_hex, request_uuid) if response_hex is not None else None
     except (

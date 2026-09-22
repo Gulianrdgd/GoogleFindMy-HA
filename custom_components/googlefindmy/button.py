@@ -1134,6 +1134,8 @@ class GoogleFindMyPlaySoundButton(GoogleFindMyButtonEntity):
                 SERVICE_PLAY_SOUND,
                 {"device_id": device_id},
                 blocking=True,
+                # Forward the press context so the service can log who pressed.
+                context=getattr(self, "_context", None),
             )
             self._update_last_pressed()
             _LOGGER.info(
